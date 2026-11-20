@@ -20,6 +20,7 @@ import os
 import pwd
 import signal
 import socket
+import struct
 import sys
 import time
 from dataclasses import dataclass, field
@@ -31,7 +32,27 @@ from .config import load as load_config
 SO_ORIGINAL_DST = 80
 EX_CONFIG = 78  # systemd RestartPreventExitStatus: configuration/safety refusal
 PULL = "PullMessages"
+# Long polls may be answered 503 when the shim is busy. Capability probes must
+# not be: Protect caches a failed GetCapabilities/GetServices until it restarts.
+EVENT_POLLS = frozenset({(soap.EVENTS, "PullMessages"), (soap.WSNT, "Renew")})
 STATUS_FILE = "status.json"
+
+
+def _reset(writer) -> None:
+    """Abort so the peer sees RST rather than a clean FIN.
+
+    ``transport.abort()`` closes the socket. After the request has been read,
+    that close is a FIN, and Protect logs "other side closed" and can mark
+    motion unsupported until it restarts. A reset is a transient failure it
+    retries. ``SO_LINGER`` with a zero timeout makes the close send RST.
+    """
+    sock = writer.get_extra_info("socket")
+    try:
+        if sock is not None:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    except OSError:
+        pass
+    writer.transport.abort()
 
 
 def original_destination(sock) -> tuple[str, int] | None:
@@ -266,16 +287,25 @@ class CameraShim:
         else:
             c.unknown_origin += 1
         direct = origin == "direct"
-        if (
-            self.stopping
-            or c.active >= self.limits.max_active_requests
-            or (direct and self.direct_active >= self.direct_budget)
-        ):
+        over_capacity = c.active >= self.limits.max_active_requests or (
+            direct and self.direct_active >= self.direct_budget
+        )
+        if self.stopping or over_capacity:
             c.rejected_busy += 1
             self.log("warn", "busy", active=c.active)
-            await self._finish(
-                writer, httpio.simple_response(503, "Service Unavailable", retry_after=1)
-            )
+            # Event polls keep 503. Anything else (GetCapabilities, GetServices,
+            # ...) is reset: a 503 there makes Protect cache "no eventServicePath".
+            # While stopping, answer 503 immediately so drain does not read a body.
+            if (
+                over_capacity
+                and not self.stopping
+                and not await self._is_event_poll(reader, writer)
+            ):
+                _reset(writer)
+            else:
+                await self._finish(
+                    writer, httpio.simple_response(503, "Service Unavailable", retry_after=1)
+                )
             return
         c.active += 1
         self.direct_active += direct
@@ -396,7 +426,7 @@ class CameraShim:
         except (OSError, TimeoutError) as exc:
             category = "connect_timeout" if isinstance(exc, TimeoutError) else "connect_failed"
             self._upstream_failed(category, connect=True, pull=is_pull)
-            writer.transport.abort()  # like an unreachable camera: no synthesized HTTP
+            _reset(writer)  # no synthesized HTTP; RST so Protect retries
             return
         local = up_writer.get_extra_info("sockname")
         local = (local[0], local[1]) if local else None
@@ -455,12 +485,44 @@ class CameraShim:
         await self._finish(writer)
 
     async def _abort_or_close(self, writer, sent: bool) -> None:
-        # Before any byte was sent, mirror the camera (it closed or failed); after
-        # a partial relay, abort so the client cannot mistake it for a full response.
+        # Before any byte was sent, reset. A clean FIN here (camera closed with
+        # no reply, timed out, or sent a protocol error) is what makes Protect
+        # cache a permanent failure. After a partial relay, abort so the client
+        # cannot mistake the bytes it got for a full response.
         if sent:
             writer.transport.abort()
         else:
-            await self._finish(writer)
+            _reset(writer)
+
+    async def _is_event_poll(self, reader, writer) -> bool:
+        """True only for PullMessages and Renew.
+
+        Used when already over capacity, so the body is read only to choose
+        503 versus RST and is never forwarded. Unreadable or unclassifiable
+        requests are not polls.
+        """
+        try:
+            async with asyncio.timeout(self.limits.client_timeout):
+                raw = await httpio.read_head(reader, self.limits.max_header_bytes, client=True)
+                request = httpio.parse_request(raw)
+                if (
+                    b"100-continue" in (request.first(b"expect") or b"").lower()
+                    and request.version == b"HTTP/1.1"
+                ):
+                    writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    await writer.drain()
+                body = await httpio.read_request_body(
+                    reader, request, self.limits.max_request_bytes
+                )
+        except (httpio.HttpError, httpio.ClientGone, TimeoutError, OSError):
+            return False
+        if request.method != b"POST" or not body:
+            return False
+        try:
+            operation = soap.parse_envelope(body).operation
+        except soap.UnsafeXML:
+            return False
+        return operation in EVENT_POLLS
 
     async def _read_payload(self, reader, kind: str, length: int) -> bytes:
         cap = self.limits.max_response_bytes

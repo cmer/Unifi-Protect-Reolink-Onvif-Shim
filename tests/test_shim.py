@@ -2,15 +2,19 @@
 
 import asyncio
 import dataclasses
+import errno
 import json
+import socket
+import struct
 import time
 
 import pytest
 
 from shimlib import config as cfgmod
 from shimlib import soap
-from shimlib.shim import CameraShim, RateLimitedLog
+from shimlib.shim import CameraShim, RateLimitedLog, _reset
 from tests.support import (
+    ENV,
     WSSE,
     MockCamera,
     ai,
@@ -18,6 +22,7 @@ from tests.support import (
     create_body,
     motion,
     pull_body,
+    renew_body,
     send,
 )
 
@@ -476,3 +481,193 @@ async def test_direct_connections_cannot_starve_redirected_traffic(h):
     for task in (first, third):
         task.cancel()
     await asyncio.gather(first, third, return_exceptions=True)
+
+
+def device_body(operation: str) -> bytes:
+    return (
+        f'<s:Envelope xmlns:s="{ENV}"><s:Body>'
+        f'<tds:{operation} xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>'
+        f"</s:Body></s:Envelope>"
+    ).encode()
+
+
+def unsubscribe_body() -> bytes:
+    return (
+        f'<s:Envelope xmlns:s="{ENV}"><s:Body>'
+        '<wsnt:Unsubscribe xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"/>'
+        "</s:Body></s:Envelope>"
+    ).encode()
+
+
+async def peer_end(port: int, raw: bytes, *, timeout: float = 5):
+    """How the shim ended `raw`: ('reset', errno), ('eof', None), or ('http', status)."""
+
+    def exchange():
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        try:
+            sock.settimeout(timeout)
+            try:
+                sock.sendall(raw)
+            except ConnectionResetError as exc:
+                return "reset", exc.errno
+            try:
+                data = sock.recv(65536)
+            except ConnectionResetError as exc:
+                return "reset", exc.errno
+        finally:
+            sock.close()
+        if not data:
+            return "eof", None
+        return "http", int(data.split(b" ", 2)[1])
+
+    return await asyncio.to_thread(exchange)
+
+
+def test_reset_sets_linger_then_aborts():
+    seen = {}
+
+    class Sock:
+        def setsockopt(self, level, option, value):
+            seen["linger"] = (level, option, value)
+
+    class Writer:
+        def __init__(self):
+            self.transport = self
+            self.aborted = False
+
+        def get_extra_info(self, name):
+            assert name == "socket"
+            return Sock()
+
+        def abort(self):
+            self.aborted = True
+
+    writer = Writer()
+    _reset(writer)
+    assert seen["linger"] == (socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    assert writer.aborted
+
+
+def test_reset_aborts_when_linger_cannot_be_set():
+    class Sock:
+        def setsockopt(self, level, option, value):
+            raise OSError("closed")
+
+    class Writer:
+        def __init__(self, sock):
+            self.transport = self
+            self.aborted = False
+            self._sock = sock
+
+        def get_extra_info(self, name):
+            return self._sock
+
+        def abort(self):
+            self.aborted = True
+
+    missing = Writer(None)
+    _reset(missing)
+    broken = Writer(Sock())
+    _reset(broken)
+    assert missing.aborted and broken.aborted
+
+
+async def test_refused_camera_resets_the_client(h):
+    cam = await h.camera()
+    port = cam.port
+    await cam.stop()
+    shim = await h.shim(port, limits={"connect_timeout": 1})
+    kind, info = await peer_end(
+        shim.port,
+        build_request(device_body("GetServices"), host="x", target="/onvif/device_service"),
+    )
+    assert (kind, info) == ("reset", errno.ECONNRESET)
+    assert shim.upstream.last_error == "connect_failed"
+
+
+async def test_connect_timeout_resets_the_client(h, monkeypatch):
+    cam = await h.camera()
+    shim = await h.shim(cam.port, limits={"connect_timeout": 0.2})
+    original = asyncio.open_connection
+
+    async def hang_upstream(host, port, *args, **kwargs):
+        if (host, port) == ("127.0.0.1", cam.port):
+            await asyncio.sleep(30)
+        return await original(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "open_connection", hang_upstream)
+    kind, info = await peer_end(
+        shim.port,
+        build_request(device_body("GetCapabilities"), host="x", target="/onvif/device_service"),
+        timeout=3,
+    )
+    assert (kind, info) == ("reset", errno.ECONNRESET)
+    assert shim.upstream.last_error == "connect_timeout"
+
+
+async def test_response_timeout_resets_the_client(h):
+    hung = await h.camera(hang=True)
+    shim = await h.shim(hung.port, limits={"response_timeout": 0.3, "drain_timeout": 0.5})
+    kind, info = await peer_end(shim.port, pull(hung), timeout=3)
+    assert (kind, info) == ("reset", errno.ECONNRESET)
+    assert shim.upstream.last_error == "response_timeout"
+
+
+async def test_upstream_close_without_response_resets_the_client(h):
+    async def serve(reader, writer):
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            length = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":", 1)[1].strip())
+            if length:
+                await reader.readexactly(length)
+            writer.close()
+            await writer.wait_closed()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    async def stop_server():
+        server.close()
+        await server.wait_closed()
+
+    h.cleanup.append(stop_server)
+    shim = await h.shim(port)
+    kind, info = await peer_end(
+        shim.port,
+        build_request(device_body("GetCapabilities"), host="x", target="/onvif/device_service"),
+    )
+    assert (kind, info) == ("reset", errno.ECONNRESET)
+    assert shim.upstream.last_error == "closed_without_response"
+
+
+async def test_busy_resets_capability_probes_and_keeps_503_for_event_polls(h):
+    cam = await h.camera(hang=True)
+    shim = await h.shim(
+        cam.port, limits={"max_active_requests": 1, "response_timeout": 5, "drain_timeout": 0.5}
+    )
+    held = asyncio.create_task(send(shim.port, pull(cam), timeout=5))
+    await asyncio.sleep(0.2)
+    assert shim.counters.active == 1
+
+    for operation in ("GetCapabilities", "GetServices"):
+        kind, info = await peer_end(
+            shim.port,
+            build_request(device_body(operation), host="x", target="/onvif/device_service"),
+        )
+        assert (kind, info) == ("reset", errno.ECONNRESET), operation
+
+    kind, info = await peer_end(shim.port, build_request(unsubscribe_body(), host="x"))
+    assert (kind, info) == ("reset", errno.ECONNRESET)
+
+    for body in (pull_body(), renew_body()):
+        kind, info = await peer_end(shim.port, build_request(body, host="x"))
+        assert (kind, info) == ("http", 503)
+
+    assert shim.counters.rejected_busy >= 5
+    held.cancel()
+    await asyncio.gather(held, return_exceptions=True)
